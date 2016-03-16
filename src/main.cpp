@@ -1,0 +1,229 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+#include <sha256.h>
+#include <printf.h>
+
+void sendNonce();
+bool validHmac(char *hmac, long nonce, char *message, uint8_t len);
+void sendDoorState();
+void toggleDoor();
+bool isValidNonce(long nonce);
+long generateNonce();
+
+const uint8_t doorTopInput = 2;
+const uint8_t doorBotInput = 3;
+const uint8_t doorControlOutput = 4;
+const uint8_t DOOROPEN = 1;
+const uint8_t DOORCLOSED = 0;
+const uint8_t DOORTRANS = 2;
+
+RF24 radio(7, 8);
+
+byte addr[][6] = {"3Node", "4Node"};
+const uint8_t secretKey[32] = {0xd8, 0x33, 0x04, 0xb7, 0x81, 0x42, 0x74, 0x34, 0xa7, 0x77, 0x25, 0xfa, 0x15, 0xe1, 0xea, 0x0b, 0x97, 0xb3, 0x29, 0xfa, 0xae, 0x4d, 0x64, 0xf5, 0x4a, 0x32, 0x53, 0xb2, 0x6e, 0x29, 0xea, 0xf8};
+//const uint8_t secretKey[32] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+//  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+//   0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
+
+
+const int maxPayloadLen = 32;
+char payload[maxPayloadLen + 1];
+unsigned long lastDoorAction = 0;
+
+struct Nonce {
+  unsigned long t;
+  long v;
+};
+
+const uint8_t maxActiveNonces = 10;
+struct Nonce activeNonces[maxActiveNonces];
+uint8_t currentNonceIdx = 0;
+
+void setup() {
+  randomSeed(analogRead(0)); // unconnected pin
+  Serial.begin(9600);
+  printf_begin();
+
+  pinMode(doorControlOutput, OUTPUT);
+
+  radio.begin();
+  radio.setRetries(15, 15);
+  radio.setDataRate(RF24_1MBPS);
+  radio.setChannel(0x4c);
+  radio.setCRCLength(RF24_CRC_16);
+  radio.enableDynamicPayloads();
+
+  radio.openWritingPipe(addr[1]);
+  radio.openReadingPipe(1, addr[0]);
+
+  radio.startListening();
+  radio.printDetails();
+}
+
+void loop() {
+  if (radio.available()) {
+    uint8_t len = radio.getDynamicPayloadSize();
+
+    radio.read(payload, len);
+    payload[len] = 0;
+
+    printf("payload: ");
+    for (int i = 0; i < len; i++) {
+      printf("%02X, ", (uint8_t)payload[i]);
+    }
+    printf("\n");
+
+    uint8_t messageType = payload[0];
+
+    if (messageType == 0xff) { // nonce request
+      sendNonce();
+    } else if (messageType == 0xaa) { // secure command
+      uint8_t messageLen = len - 29;
+      uint8_t hmacLen = 24;
+      uint8_t nonceLen = sizeof(long);
+
+      char hmac[hmacLen];
+      char message[messageLen + 1];
+      char nonceBuf[nonceLen];
+      memcpy(hmac, payload + 1, hmacLen);
+      memcpy(nonceBuf, payload + 1 + hmacLen, nonceLen);
+      memcpy(message, payload + 1 + hmacLen + nonceLen, messageLen);
+      message[messageLen] = 0;
+
+      long nonce = 0;
+      for (uint8_t i = 0; i < nonceLen; i++) {
+        unsigned long tmp = nonceBuf[i];
+        tmp &= 0xff;
+        nonce += tmp << 8 * i;
+      }
+
+      if (validHmac(hmac, nonce, message, hmacLen)) {
+        switch (message[0]) {
+          case 0x01:
+            sendDoorState();
+            break;
+          case 0x02:
+            toggleDoor();
+            break;
+        }
+      } else {
+        printf("Invalid HMAC\n");
+      }
+    }
+
+  }
+}
+
+void toggleDoor() {
+  unsigned long now = millis();
+  printf("toggling door %ld\n", now - lastDoorAction);
+  if (now - lastDoorAction > 1000) {
+    lastDoorAction = now;
+    digitalWrite(doorControlOutput, HIGH);
+    delay(1000);
+    digitalWrite(doorControlOutput, LOW);
+  }
+}
+
+// 0 = closed, 1 = open, 2 = in transition
+uint8_t getDoorState() {
+  int doorTop = digitalRead(doorTopInput);
+  int doorBot = digitalRead(doorBotInput);
+
+  return doorTop == HIGH ? DOOROPEN : doorBot == HIGH ? DOORCLOSED : DOORTRANS;
+}
+
+void sendDoorState() {
+  radio.stopListening();
+
+  uint8_t state = getDoorState();
+  printf("doorstate: %i\n", state);
+  radio.write(&state, 1);
+
+  radio.startListening();
+}
+
+bool validHmac(char *hmac, long nonce, char *message, uint8_t len) {
+  if (!isValidNonce(nonce)) {
+    return false;
+  }
+
+  uint8_t nonceBufLen = sizeof(long) + 1;
+  char nonceBuf[nonceBufLen];
+
+  for (uint8_t i = 0; i < sizeof(long); i++) {
+    nonceBuf[i] = (nonce >> 8 * i) & 0xff;
+  }
+
+  nonceBuf[nonceBufLen - 1] = 0;
+
+  uint8_t *checkHash;
+  Sha256.initHmac(secretKey, 32);
+  Sha256.print(nonceBuf);
+  Sha256.print(message);
+  checkHash = Sha256.resultHmac();
+  checkHash[224] = 0;
+
+  for (int i = 0; i < len; i++) {
+    printf("%02X/%02X, ", checkHash[i], (uint8_t)hmac[i]);
+  }
+  printf("\n");
+  for (int i = 0; i < len; i++) {
+    if (checkHash[i] != (uint8_t)hmac[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void sendNonce() {
+  radio.stopListening();
+
+  long nonce = generateNonce();
+  printf("Nonce: %ld\n", nonce);
+  char mlen = 2 + sizeof(long);
+  char message[mlen];
+  message[0] = 0xff;
+  message[1] = sizeof(long);
+  memcpy(message + 2, &nonce, message[1]);
+  radio.write(message, mlen);
+
+  radio.startListening();
+}
+
+// Nonces invalidate after 2 sec
+bool isValidNonce(long nonce) {
+  unsigned long now = millis();
+  for (uint8_t i = 0; i < maxActiveNonces; i++) {
+    if (nonce == activeNonces[i].v && now - activeNonces[i].t < 2000) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void printActiveNonces() {
+  printf("ACTIVE: ");
+  for (uint8_t i = 0; i < maxActiveNonces; i++) {
+    printf("%ld/%ld ", activeNonces[i].t, activeNonces[i].v);
+  }
+  printf("\n");
+}
+
+long generateNonce() {
+  long nonce = random();
+  unsigned long now = millis();
+
+  struct Nonce *currentNonce = &activeNonces[currentNonceIdx];
+  currentNonce->t = now;
+  currentNonce->v = nonce;
+
+  currentNonceIdx++;
+  if (currentNonceIdx >= maxActiveNonces) {
+    currentNonceIdx = 0;
+  }
+  return nonce;
+}
