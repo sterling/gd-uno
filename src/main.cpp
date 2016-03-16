@@ -1,9 +1,33 @@
 #include <Arduino.h>
-#include <SPI.h>
-#include <nRF24L01.h>
 #include <RF24.h>
 #include <sha256.h>
 #include <printf.h>
+#include "LedControl.h"
+#include "SingleFrameAnimatedMatrix.h"
+
+byte arrowUp[8] = {
+	B00011000,
+	B00111100,
+	B01111110,
+	B11011011,
+	B00011000,
+	B00011000,
+	B00011000,
+	B00011000
+};
+
+byte arrowDown[8] = {
+	B00011000,
+	B00011000,
+	B00011000,
+	B00011000,
+	B11011011,
+	B01111110,
+	B00111100,
+	B00011000
+};
+
+SingleFrameAnimatedMatrix ma = SingleFrameAnimatedMatrix(arrowDown, 0);
 
 void sendNonce();
 bool validHmac(char *hmac, long nonce, char *message, uint8_t len);
@@ -21,7 +45,7 @@ const uint8_t DOORTRANS = 2;
 
 RF24 radio(7, 8);
 
-byte addr[][6] = {"3Node", "4Node"};
+byte addr[][6] = {"1Node", "2Node"};
 const uint8_t secretKey[32] = {0xd8, 0x33, 0x04, 0xb7, 0x81, 0x42, 0x74, 0x34, 0xa7, 0x77, 0x25, 0xfa, 0x15, 0xe1, 0xea, 0x0b, 0x97, 0xb3, 0x29, 0xfa, 0xae, 0x4d, 0x64, 0xf5, 0x4a, 0x32, 0x53, 0xb2, 0x6e, 0x29, 0xea, 0xf8};
 //const uint8_t secretKey[32] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 //  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -64,6 +88,9 @@ void setup() {
 }
 
 void loop() {
+	ma.scroll(0);
+	delay(100);
+
   if (radio.available()) {
     uint8_t len = radio.getDynamicPayloadSize();
 
